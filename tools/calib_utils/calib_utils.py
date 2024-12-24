@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+import torch.distributions as D
 from sklearn.mixture import GaussianMixture
 from scipy.optimize import differential_evolution
 
@@ -12,6 +13,12 @@ from pcdet.config import cfg
 from pcdet.models import build_network, load_data_to_gpu
 from pcdet.utils.spconv_utils import spconv
 from pcdet.utils import commu_utils
+
+import normflows as nf  # me
+from sklearn.preprocessing import StandardScaler # me
+# from torch.utils.tensorboard import SummaryWriter # me 
+from tensorboardX import SummaryWriter # me
+import matplotlib.pyplot as plt
 
 
 class ProbModel(ABC):
@@ -22,7 +29,115 @@ class ProbModel(ABC):
     @abstractmethod
     def pred(self, data):
         pass
+        
+        
+############################################################# HERE is the new class created to implement Normalizing Flows
+class NF(ProbModel):
+    #epochs=200, learning_rate=0.00001578 = loss about 3
+    # 0.0001 0.00001578
+    #315 and 0.000028
+    #15000
+    def __init__(self, distribution_dim, batch_size, num_of_flows=4, epochs=25000, learning_rate=0.000002):
+        print("Start of the NF::__init__ function.")
+        self.epochs = epochs
+        self.learning_rate = learning_rate
+    
+        # self.base_distribution = D.MultivariateNormal(
+        #     torch.zeros(distribution_dim),
+        #    torch.eye(distribution_dim))
+        self.base_distribution = nf.distributions.base.DiagGaussian(distribution_dim)
+      
+        self.transforms = []
+        self.scaler = None
+        #some_data = torch.randn(batch_size, distribution_dim // 2, dtype=torch.float32)
+        
+        print("Construction flows in NF::__init__")
+        for i in range(num_of_flows):
+            # Create an affine coupling layer
+            param_map = nf.nets.MLP([distribution_dim // 2, distribution_dim*16, distribution_dim*16, distribution_dim*16, distribution_dim*16, distribution_dim], init_zeros=True)
+                   
+            self.transforms.append(nf.flows.AffineCouplingBlock(param_map))  # Add flow layer
+            
+            # Add a permutation layer (e.g., swap dimensions)
+            self.transforms.append(nf.flows.Permute(distribution_dim, mode='swap'))
+   
+        # Combine the transforms into a normflows.Flow object    
+        self.flow = nf.NormalizingFlow(self.base_distribution, self.transforms)
+        print(self.flow)
+        print("End of the NF::__init__")
 
+   
+    def fit(self, data):
+        print("Start of the NF::fit funciton.")
+        writer = SummaryWriter(log_dir="loss_log_file")  # me: Specify the log directory
+        # Convert data to PyTorch tensor if needed
+        data = data.cpu() if torch.is_tensor(data) else torch.tensor(data, dtype=torch.float32)
+        print("THESE ARE DATA:")
+        print(data[0:2])
+        
+        self.scaler = StandardScaler() # me
+        #print(scaler)
+        data_normalized = torch.tensor(self.scaler.fit_transform(data), dtype=torch.float32) # me
+        
+        # Optimizer
+        # This creates an instance of the Adam optimizer, which is a popular choice for gradient-based optimization due to its adaptive learning rate and momentum.
+        #optimizer = torch.optim.Adam(self.transforms.parameters(), lr=self.learning_rate)
+        optimizer = torch.optim.AdamW(self.flow.parameters(), lr=self.learning_rate)
+        
+        print("============ Value of loss ==========")
+        loss_values = []
+        # Training loop
+        for epoch in range(self.epochs):
+            optimizer.zero_grad()
+            #loss = -self.flow.log_prob(data_normalized).mean()  # Negative log-likelihood
+            loss = self.flow.forward_kld(data_normalized)
+            
+            value = loss.item()
+            writer.add_scalar("loss_log_file", loss.item(), epoch)
+            #print(epoch, value)
+            loss_values.append(value)
+
+            
+            if ~(torch.isnan(loss) | torch.isinf(loss)):
+                loss.backward()
+                # Clip gradients to prevent exploding
+                torch.nn.utils.clip_grad_norm_(self.flow.parameters(), max_norm=1.0)
+
+                # Print gradients for debugging (optional)
+                '''for name, param in self.flow.named_parameters():
+                    if param.grad is not None:
+                        print(f"Gradient norm for {name}: {param.grad.norm().item()}")'''
+                
+                optimizer.step()
+                
+        writer.close()
+   
+        print("End of the NF::fit funciton.")
+        
+        return self
+    
+    
+    def pred(self, data):
+        print("Start of the NF::pred function.")
+        # print(f"data dimensions {data.shape[0]}  {data.shape[1]}     AND      base distribution dimensions {self.base_distribution.event_shape[0]}")
+        # Evaluate negative log probability
+        #import ipdb; ipdb.set_trace()
+        data = data.cpu() if torch.is_tensor(data) else torch.tensor(data, dtype=torch.float32)
+        
+        # apply normalization
+        #data_normalized = torch.tensor(scaler.fit_transform(data), dtype=torch.float32) # me before
+        data_normalized = torch.tensor(self.scaler.transform(data), dtype=torch.float32) # me
+        
+        #return -self.flow.log_prob(data).mean().item()
+        #print("In NF::pred function before log_prob we print 2 rows of normalized data: ", data_normalized[0:2])
+        #print("In NF::pred function before log_prob we print 2 rows of normalized data: ", data_normalized[2:5])
+        ret_val = -self.flow.log_prob(data_normalized).mean().item()
+        #print("ret_val is: ", ret_val)
+        print("End of the NF::pred function.")
+        return ret_val
+        
+
+ ############################################################# END END END END
 
 class GMM(ProbModel):
     def __init__(self, n_components):
@@ -172,8 +287,18 @@ class AnchorCalibrator:
             instance_features = commu_utils.all_gather(
                 instance_features)
             instance_features = torch.cat(instance_features, dim=0)
+            
+        
+        # Apply normalization
+        scaler = StandardScaler() # me
+        instance_features = torch.tensor(scaler.fit_transform(instance_features.cpu()), dtype=torch.float32).cuda() # me
+            
+        print(f"instance_features.shape: {instance_features.shape}") # me
+        
         return instance_features
 
+
+    # Here instance_feature is the "source feature databese"
     def fit_gmm(self, instance_features, n_components):
         if commu_utils.get_rank() == 0:
             self.logger.info(
@@ -185,8 +310,32 @@ class AnchorCalibrator:
         if commu_utils.get_world_size() > 1:
             dist.broadcast_object_list(gmm)
         return gmm[0]
+  
+########################################  
+    def fit_nf(self, instance_features):
+        if commu_utils.get_rank() == 0:
+            self.logger.info(f'Estimating NF parameters using {instance_features.shape[0]} samples...')
+            self.logger.info(f'instance_features number of features/columns {instance_features.shape[1]}')
+            print("<<<<<<<<<<<<<<<<<<<<<", instance_features)
+                
+            # Initialize Normalizing Flow
+            nf_model = NF(distribution_dim=instance_features.shape[1], batch_size=instance_features.shape[0])
+            # Fit the NF model
+            nf_model.fit(instance_features)
+            
+            self.logger.info('Finished NF estimation.')
+            nf = [nf_model]
+        else:
+            nf = [None]
+            
+        if commu_utils.get_world_size() > 1:
+            dist.broadcast_object_list(nf)
+            
+        return nf[0]
+######################################## 
 
-    def linear_search(self, gmm, data_loader, class_id, search_range=0.2, step=0.05):
+    #def linear_search(self, gmm, data_loader, class_id, search_range=0.2, step=0.05):
+    def linear_search(self, nf, data_loader, class_id, search_range=0.2, step=0.05): ############################################
         current_anchors = copy.deepcopy(self._get_anchors(class_id))
         anchors_search_range = current_anchors * search_range
         anchor_ranges = [np.around(e, 1) for e in zip(
@@ -206,9 +355,11 @@ class AnchorCalibrator:
                     cfg.SAILOR.TARGET.THRESHOLD[class_id],
                     tmp_anchors
                 )
+                print(">>>>>>>>>>>>>>>>>>>>", cur_instance_features)
 
                 explored_anchors.append(tmp_anchors)
-                explored_scores.append(gmm.pred(cur_instance_features))
+                #explored_scores.append(gmm.pred(cur_instance_features))
+                explored_scores.append(nf.pred(cur_instance_features)) ############################################
 
                 self.logger.info(
                     f'Anchor: {np.round(explored_anchors[-1], 2)}\tScore: {np.round(explored_scores[-1], 2)}')
@@ -219,7 +370,8 @@ class AnchorCalibrator:
             f'Linear search results for class {cfg.DATA_CONFIG_TARGET.CLASS_NAMES[class_id]}: {np.round(optimal_anchors, 2)}')
         self._set_anchors(class_id, optimal_anchors)
 
-    def joint_optimization(self, gmm, data_loader, class_id, search_range=0.1):
+    #def joint_optimization(self, gmm, data_loader, class_id, search_range=0.1):
+    def joint_optimization(self, nf, data_loader, class_id, search_range=0.1): ############################################
         current_anchors = copy.deepcopy(self._get_anchors(class_id))
         bounds = np.array([(a-search_range, a+search_range)
                           for a in current_anchors])
@@ -232,7 +384,8 @@ class AnchorCalibrator:
                 cfg.SAILOR.TARGET.THRESHOLD[class_id],
                 anc
             )
-            score = gmm.pred(cur_instance_features)
+            #score = gmm.pred(cur_instance_features)
+            score = nf.pred(cur_instance_features) ############################################
             self.logger.info(
                 f'Anchor: {np.round(anc, 2)}\tScore: {np.round(score, 2)}')
             return score
@@ -256,13 +409,21 @@ def calibrate(source_loader, target_loader, pretrained_model, dist, logger):
         )
 
         # fit a GMM to the data
-        n_components = cfg.SAILOR.SOURCE.GMM_COMPONENTS[class_id]
-        gmm = calibrator.fit_gmm(source_instance_features, n_components)
+        #n_components = cfg.SAILOR.SOURCE.GMM_COMPONENTS[class_id]
+        #gmm = calibrator.fit_gmm(source_instance_features, n_components)
+        nf = calibrator.fit_nf(source_instance_features)  #############################################
 
         if cfg.SAILOR.LINEAR_SEARCH:
             # perform linear search for each parameter separately
-            calibrator.linear_search(gmm, target_loader, class_id)
+            #calibrator.linear_search(gmm, target_loader, class_id) # with gmm was before. Below is with norm. flows
+            calibrator.linear_search(nf, target_loader, class_id) ############################################
 
         if cfg.SAILOR.JOINT_OPTIMIZATION:
             # perform joint optimization
-            calibrator.joint_optimization(gmm, target_loader, class_id)
+            #calibrator.joint_optimization(gmm, target_loader, class_id) # was before. Below is with norm. flows
+            calibrator.joint_optimization(nf, target_loader, class_id) ############################################
+            
+            
+            
+            
+            

@@ -14,6 +14,7 @@ from eval_utils import eval_utils
 from calib_utils.calib_utils import calibrate
 
 
+
 def parse_config():
     parser = argparse.ArgumentParser(description='arg parser')
     parser.add_argument('--cfg_file', type=str, default=None,
@@ -57,6 +58,8 @@ def main():
         )
         dist = True
 
+
+    
     if args.batch_size is None:
         args.batch_size = cfg.OPTIMIZATION.BATCH_SIZE_PER_GPU
     else:
